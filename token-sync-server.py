@@ -39,10 +39,13 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
+PROJECTS_DIR = Path.home() / ".claude" / "projects"
 CONFIG_DIR = Path.home() / ".config" / "clawdmeter-token-sync"
 SECRET_PATH = CONFIG_DIR / "secret"
 DEFAULT_PORT = 47821
 MACOS_KEYCHAIN_SERVICE = "Claude Code-credentials"
+DEFAULT_CONTEXT_WINDOW = 200_000
+LONG_CONTEXT_WINDOW = 1_000_000
 
 log = logging.getLogger("clawdmeter-sync")
 
@@ -166,6 +169,103 @@ def _nested(obj: dict, dotted: str):
     return cur
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Claude Code session/context introspection
+# ─────────────────────────────────────────────────────────────────────
+
+def _project_label(raw_id: str) -> str:
+    """Turn the on-disk folder name (e.g. `-Users-squall-dev-clawdmeter`)
+    into a human-friendly display label (`clawdmeter`)."""
+    parts = raw_id.lstrip("-").split("-")
+    # Strip leading `Users/<user>/` if present so the label focuses on
+    # the project subpath, not the home dir.
+    if len(parts) >= 3 and parts[0] == "Users":
+        parts = parts[2:]
+    if not parts:
+        return raw_id
+    return "/".join(parts)
+
+
+def list_projects() -> list[dict]:
+    """All Claude Code projects with at least one .jsonl session, sorted by
+    most recent activity."""
+    if not PROJECTS_DIR.is_dir():
+        return []
+    out: list[dict] = []
+    for proj in PROJECTS_DIR.iterdir():
+        if not proj.is_dir():
+            continue
+        jsonls = list(proj.glob("*.jsonl"))
+        if not jsonls:
+            continue
+        latest = max(jsonls, key=lambda p: p.stat().st_mtime)
+        out.append({
+            "id": proj.name,
+            "label": _project_label(proj.name),
+            "lastActiveAt": int(latest.stat().st_mtime * 1000),
+        })
+    out.sort(key=lambda p: -p["lastActiveAt"])
+    return out
+
+
+def get_context_usage(project_id: str) -> dict | None:
+    """Return the most recent assistant turn's context usage for the
+    latest session in the given project. Returns None if the project
+    doesn't exist or has no assistant message yet."""
+    proj = PROJECTS_DIR / project_id
+    if not proj.is_dir():
+        return None
+    jsonls = list(proj.glob("*.jsonl"))
+    if not jsonls:
+        return None
+    latest = max(jsonls, key=lambda p: p.stat().st_mtime)
+
+    last_usage = None
+    last_model: str | None = None
+    try:
+        with latest.open("r") as f:
+            for line in f:
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if msg.get("type") != "assistant":
+                    continue
+                inner = msg.get("message") or {}
+                u = inner.get("usage")
+                if u:
+                    last_usage = u
+                    last_model = inner.get("model")
+    except OSError:
+        return None
+
+    if not last_usage:
+        return None
+
+    used = (
+        int(last_usage.get("input_tokens") or 0)
+        + int(last_usage.get("cache_read_input_tokens") or 0)
+        + int(last_usage.get("cache_creation_input_tokens") or 0)
+    )
+    # Pick context window. JSONL doesn't always carry the [1m] suffix
+    # even when the long-context variant is in use, so fall back to
+    # detecting via observed token count > standard window.
+    if last_model and "[1m]" in last_model:
+        window = LONG_CONTEXT_WINDOW
+    elif used > DEFAULT_CONTEXT_WINDOW:
+        window = LONG_CONTEXT_WINDOW
+    else:
+        window = DEFAULT_CONTEXT_WINDOW
+    return {
+        "model": last_model,
+        "contextUsed": used,
+        "contextWindow": window,
+        "outputTokens": int(last_usage.get("output_tokens") or 0),
+        "sessionId": latest.stem,
+        "updatedAt": int(latest.stat().st_mtime * 1000),
+    }
+
+
 class TokenHandler(BaseHTTPRequestHandler):
     secret: str = ""
 
@@ -191,20 +291,39 @@ class TokenHandler(BaseHTTPRequestHandler):
         if path == "/health":
             self._json(200, {"ok": True})
             return
-        if path != "/token":
-            self._json(404, {"error": "not_found"})
+        if path == "/token":
+            if not self._check_auth():
+                self._json(401, {"error": "unauthorized"})
+                return
+            try:
+                self._json(200, read_token())
+            except FileNotFoundError as e:
+                self._json(404, {"error": "no_credentials", "message": str(e)})
+            except Exception as e:
+                log.exception("Failed to read token")
+                self._json(500, {"error": "internal", "message": str(e)})
             return
-        if not self._check_auth():
-            self._json(401, {"error": "unauthorized"})
+        if path == "/projects":
+            if not self._check_auth():
+                self._json(401, {"error": "unauthorized"})
+                return
+            self._json(200, list_projects())
             return
-        try:
-            payload = read_token()
-            self._json(200, payload)
-        except FileNotFoundError as e:
-            self._json(404, {"error": "no_credentials", "message": str(e)})
-        except Exception as e:
-            log.exception("Failed to read token")
-            self._json(500, {"error": "internal", "message": str(e)})
+        if path.startswith("/projects/") and path.endswith("/context"):
+            if not self._check_auth():
+                self._json(401, {"error": "unauthorized"})
+                return
+            project_id = path[len("/projects/"):-len("/context")]
+            if not project_id or "/" in project_id or project_id.startswith("."):
+                self._json(400, {"error": "bad_project_id"})
+                return
+            data = get_context_usage(project_id)
+            if data is None:
+                self._json(404, {"error": "no_session"})
+                return
+            self._json(200, data)
+            return
+        self._json(404, {"error": "not_found"})
 
     def log_message(self, format, *args):  # quieter default logs
         log.info("%s - %s", self.client_address[0], format % args)
